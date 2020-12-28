@@ -10,7 +10,7 @@ plt.rcParams["figure.figsize"] = (3.4, 3.4)
 def run_suite(num_index_cases, trace_delay=0, test_delay=0,
               trace_false_negative=0.0, cases_contacted=0.0,
               base_reduction=0.0, seed=0, dropout=0.05):
-    table_mat = np.zeros((14, 5))
+    table_mat = np.zeros((20, 5))
     tmp = build_contact_trees.contact_tracing(num_index_cases, trace=False,
                         trace_delay=trace_delay,
                         test_delay=test_delay,
@@ -358,6 +358,27 @@ def run_suite(num_index_cases, trace_delay=0, test_delay=0,
     table_mat[i][3] = np.around(tmp[6][0], 1)
     table_mat[i][4] = np.around(tmp[5][0], 0)
 
+    print("\nSingle Test 5 days after")
+    tmp = build_contact_trees.contact_tracing(num_index_cases, trace=True,
+                          trace_delay=trace_delay,
+                          test_delay=test_delay,
+                          trace_false_negative=trace_false_negative,
+                          cases_contacted=cases_contacted,
+                          ttq=True,
+                          wait_until_testing=6,
+                          base_reduction=base_reduction,
+                          wait_before_testing=0,
+                          ttq_double=False,
+                          monitor=False,
+                          seed=seed,
+                          quarantine_dropout_rate=dropout)
+    i = 14
+    table_mat[i][0] = np.around(tmp[7], 3)
+    table_mat[i][1] = np.around((1 - tmp[7] / base_reff) * 100, 1)
+    table_mat[i][2] = np.around(tmp[2][0], 1)
+    table_mat[i][3] = np.around(tmp[6][0], 1)
+    table_mat[i][4] = np.around(tmp[5][0], 0)
+
     print("No contact tracing & " + " & ".join(map(str, table_mat[0])) + "\\\\")
     print("Quarantine-only & " + " & ".join(map(str, table_mat[1])) + "\\\\")
     print("RBQ & " + " & ".join(map(str, table_mat[4])) + "\\\\")
@@ -372,9 +393,85 @@ def run_suite(num_index_cases, trace_delay=0, test_delay=0,
     print("RBQ + exit testing + 4 extra observation days for clusters of size 8 or less + active monitoring & " + " & ".join(map(str, table_mat[13])) + "\\\\")
     print("Single-test release & " + " & ".join(map(str, table_mat[2])) + "\\\\")
     print("Double-test release & " + " & ".join(map(str, table_mat[3])) + "\\\\")
+    print("Single-test release CDC & " + " & ".join(map(str, table_mat[14])) + "\\\\")
 
     code.interact(local=locals())
 
+def run_suite_CDC(num_index_cases, trace_delay=0, test_delay=0,
+                  trace_false_negative=0.0, cases_contacted=0.0,
+                  base_reduction=0.0, seed=0, dropout=0.05):
+    fixed_duration = np.zeros((20, 5))
+    with_testing = np.zeros((20, 5))
+    tmp = build_contact_trees.contact_tracing(num_index_cases, trace=False,
+                        trace_delay=trace_delay,
+                        test_delay=test_delay,
+                        trace_false_negative=trace_false_negative,
+                        cases_contacted=cases_contacted,
+                        ttq=False,
+                        base_reduction=base_reduction,
+                        wait_before_testing=0,
+                        ttq_double=False,
+                        monitor=False,
+                        seed=seed)
+    base_reff = tmp[7]
+
+    i = 0
+    fixed_duration[i][0] = np.around(tmp[7], 3)
+    fixed_duration[i][1] = np.around((1 - tmp[7] / base_reff) * 100, 1)
+    fixed_duration[i][2] = np.around(tmp[2][0], 1)
+    fixed_duration[i][3] = np.around(tmp[6][0], 1)
+    fixed_duration[i][4] = np.around(tmp[5][0], 0)
+
+    for quarantine_length in range(0, 14):
+        build_contact_trees.asymp_quarantine_length = quarantine_length
+        tmp = build_contact_trees.contact_tracing(num_index_cases, trace=True,
+                            trace_delay=trace_delay,
+                            test_delay=test_delay,
+                            trace_false_negative=trace_false_negative,
+                            cases_contacted=cases_contacted,
+                            ttq=False,
+                            base_reduction=base_reduction,
+                            wait_before_testing=0,
+                            ttq_double=False,
+                            monitor=False,
+                            seed=seed)
+        i = quarantine_length
+        fixed_duration[i][0] = np.around(tmp[7], 3)
+        fixed_duration[i][1] = np.around((1 - tmp[7] / base_reff) * 100, 1)
+        fixed_duration[i][2] = np.around(tmp[2][0], 1)
+        fixed_duration[i][3] = np.around(tmp[6][0], 1)
+        fixed_duration[i][4] = np.around(tmp[5][0], 0)
+
+    build_contact_trees.asymp_quarantine_length = 14
+    for test_day in range(1, 12):
+        tmp = build_contact_trees.contact_tracing(num_index_cases, trace=True,
+                            trace_delay=trace_delay,
+                            test_delay=test_delay,
+                            trace_false_negative=trace_false_negative,
+                            cases_contacted=cases_contacted,
+                            ttq=True,
+                            wait_until_testing=test_day,
+                            base_reduction=base_reduction,
+                            wait_before_testing=0,
+                            ttq_double=False,
+                            monitor=False,
+                            seed=seed)
+        i = test_day
+        with_testing[i][0] = np.around(tmp[7], 3)
+        with_testing[i][1] = np.around((1 - tmp[7] / base_reff) * 100, 1)
+        with_testing[i][2] = np.around(tmp[2][0], 1)
+        with_testing[i][3] = np.around(tmp[6][0], 1)
+        with_testing[i][4] = np.around(tmp[5][0], 0)
+
+    plt.scatter(fixed_duration[0,2], fixed_duration[0,0], label="no tracing")
+    plt.scatter(fixed_duration[1:14,2], fixed_duration[1:14,0], label="fixed duration")
+    plt.scatter(with_testing[0:12,2], with_testing[0:12,0], label="test release")
+    plt.tight_layout()
+    plt.legend()
+    plt.xlabel("Quarantine days per index case")
+    plt.ylabel("Effective reproduction ratio")
+    plt.show()
+    code.interact(local=locals())
 
 def run_suite_delay(num_index_cases, trace_delay=0, test_delay=0,
               trace_false_negative=0.0, cases_contacted=0.0,

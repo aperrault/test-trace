@@ -16,6 +16,7 @@ from multiprocessing import Pool
 import math
 import random
 import scipy.optimize
+import json
 
 age_intervals = [(0, 14), (15, 24), (25, 54), (55, 64), (65, np.inf)]
 age_specific_IFRs = np.array([0.0001, 0.0001, 0.0013, 0.007, 0.068])
@@ -159,7 +160,7 @@ def calc_test_single(test_time_rel_to_symptoms, I_COVID):
 def draw_seed_index_cases(num_individuals, age_vector, cases_contacted=1.0,
                           t_exposure=None, fpr=false_positive_rate, initial=False, skip_days=False,
                           random_testing=False, test_freq=0., test_delay=0.,
-                          frac_SS=frac_SS_cal, seed=0):
+                          frac_SS=frac_SS_cal, frac_vacc=0., seed=0):
     np.random.seed(seed)
     if t_exposure is None:
         t_exposure = np.zeros(num_individuals)
@@ -178,6 +179,10 @@ def draw_seed_index_cases(num_individuals, age_vector, cases_contacted=1.0,
     else:
         params['I_asymptoms'] = np.zeros(num_individuals)
     params['I_symptoms'] = 1 - params['I_asymptoms']
+    if not initial:
+        params['I_vacc'] = scipy.stats.bernoulli.rvs(p=frac_vacc, size=num_individuals)
+    else:
+        params['I_vacc'] = np.zeros(num_individuals) # TODO: HACK
     params['t_incubation'] = np.maximum(scipy.stats.lognorm.rvs(s=0.65, scale=np.exp(1.57), size=num_individuals), 0) + t_exposure
     params['t_incubation_infect'] = np.maximum(params['t_incubation'] - days_infectious_before_symptoms, 0)
     if initial:
@@ -219,7 +224,7 @@ def draw_seed_index_cases(num_individuals, age_vector, cases_contacted=1.0,
     return params
 
 @njit
-def draw_contacts(contact_days, n_transmission_days, t_incubation_infect, index, base_reduction=0.0, get_dummy=False,
+def draw_contacts(contact_days, n_transmission_days, t_incubation_infect, index, base_reduction=0., get_dummy=False, frac_vacc=0.,
                   seed=0):
     np.random.seed(seed)
     contact_list = List()
@@ -237,8 +242,8 @@ def draw_contacts(contact_days, n_transmission_days, t_incubation_infect, index,
                         if not np.random.binomial(n=1, p=1 - base_reduction):
                             continue
                 """ contact format: (age of contact, gender, is_household, is_daily,
-                                     t_exposure, index of infector, t_last_exposure, is_physical) """
-                contact_ext = np.zeros(8)
+                                     t_exposure, index of infector, t_last_exposure, is_physical, contact_is_vacc) """
+                contact_ext = np.zeros(9)
                 contact_ext[0] = contact[0]
                 contact_ext[1] = contact[1]
                 contact_ext[2] = contact[2]
@@ -256,19 +261,20 @@ def draw_contacts(contact_days, n_transmission_days, t_incubation_infect, index,
                 contact_ext[4] = day_of_infection + t_incubation_infect
                 contact_ext[5] = index
                 contact_ext[7] = contact[4]
+                contact_ext[8] = np.random.binomial(n=1, p=frac_vacc)
                 contact_list.append(contact_ext)
     return contact_list
 
 @njit
 def draw_all_contacts(contacts_by_age, n_transmission_days, t_incubation_infect, num_individuals, base_reduction=0.0,
-                      seed=0):
+                      frac_vacc=0., seed=0):
     np.random.seed(seed)
     contact_dict = List()
     for i in range(num_individuals):
         a = draw_contacts(contact_days=contacts_by_age[0],
                           n_transmission_days=n_transmission_days[0],
                           t_incubation_infect=t_incubation_infect[0],
-                          index=i, get_dummy=True)
+                          index=i, frac_vacc=frac_vacc, get_dummy=True)
         if len(a) > 0:
             break
     for i in range(num_individuals):
@@ -277,11 +283,12 @@ def draw_all_contacts(contacts_by_age, n_transmission_days, t_incubation_infect,
         contact_dict[i] = draw_contacts(contact_days=contacts_by_age[i],
                                         n_transmission_days=n_transmission_days[i],
                                         t_incubation_infect=t_incubation_infect[i],
+                                        frac_vacc=frac_vacc,
                                         index=i, base_reduction=base_reduction)
     return contact_dict
 
 """ draw index cases assuming uniform attack rate. draw contacts from POLYMOD """
-def draw_contact_generation(index_cases, base_reduction=0.0, seed=0):
+def draw_contact_generation(index_cases, base_reduction=0.0, frac_vacc=0.0, seed=0):
     num_individuals = len(index_cases['I_COVID'])
     if num_individuals == 0:
         return []
@@ -291,6 +298,7 @@ def draw_contact_generation(index_cases, base_reduction=0.0, seed=0):
                                      t_incubation_infect=index_cases['t_incubation_infect'],
                                      num_individuals=num_individuals,
                                      base_reduction=base_reduction,
+                                     frac_vacc=frac_vacc,
                                      seed=seed)
     return contact_dict
 
@@ -303,7 +311,8 @@ def fill_QII(t_exposure, t_last_exposure, trace_delay, test_delay, t_self_isolat
              g0_I_superspreader, false_negative_traces, trace=False, ttq=False,
              quarantine_by_parent_case_release=False,
              early_release_by_parent_case=np.zeros(1), early_release=False,
-             wait_before_testing=0, ttq_double=False, dropouts=np.zeros(1).reshape(1, -1),
+             wait_before_testing=0, wait_until_testing=0,
+             ttq_double=False, dropouts=np.zeros(1).reshape(1, -1),
              precalc_dropout=0,
              monitor=False, seed=0, hold_hh=False,
              quarantine_dropout_rate=quarantine_dropout_rate_default):
@@ -354,7 +363,7 @@ def fill_QII(t_exposure, t_last_exposure, trace_delay, test_delay, t_self_isolat
             if ttq:
                 if not early_release:
                     I_test = True
-                    t_test_day = t_quarantine_start + wait_before_testing
+                    t_test_day = max(t_quarantine_start + wait_before_testing, t_last_exposure[i] + wait_until_testing + wait_before_testing)
                 elif early_release and quarantine_by_parent_case_release[parent_case] and not (hold_hh and I_household[i]):
                     I_test = True
                     t_test_day = t_quarantine_start + early_release_by_parent_case[parent_case]
@@ -586,7 +595,7 @@ def draw_infections_from_contacts(num_individuals, g0_COVID, g0_symptoms,
                                   g0_t_self_isolate, g0_I_contacted,
                                   g0_contacts, trace_delay=0, test_delay=0,
                                   trace=False, trace_superspreader=False,
-                                  ttq=False, early_release=False,
+                                  ttq=False, early_release=False, vacc_eff=0.,
                                   tfn=0.0, wait_before_testing=0, ttq_double=False,
                                   household_SAR=base_household_cal, external_SAR=base_external_cal,
                                   SS_mult=SS_mult_cal, phys_mult=phys_mult_cal,
@@ -652,6 +661,9 @@ def draw_infections_from_contacts(num_individuals, g0_COVID, g0_symptoms,
             if i == 0:
                 SARS.append(SAR)
             infected = np.random.binomial(n=1, p=SAR)
+            if infected and g0_contacts[i][j][8]:
+                if np.random.binomial(n=1, p=vacc_eff):
+                    infected = False
             if infected:
                 if g0_contacts[i][j][2]:
                     household_infections += 1
@@ -781,7 +793,8 @@ def calc_symptoms_by_day(g1_I_symptoms, g1_infected_by, g1_t_incubation, g1_fals
 
 @njit
 def calc_quarantine_uninfected(trace_start, quarantine_end, t_exposure,
-                               wait_before_testing=0, test_delay=0,
+                               wait_before_testing=0, test_day=0,
+                               test_delay=0,
                                early_release_day=0, early_release=False,
                                n_consec_test=0, test_release=False,
                                I_monitor=False, monitor_start=0,
@@ -822,7 +835,7 @@ def calc_quarantine_uninfected(trace_start, quarantine_end, t_exposure,
                 t_self_isolate = day
                 t_self_isolate_end = t_self_isolate + symp_quarantine_length
 
-        if test_release and day >= test_results_day:
+        if test_release and day >= test_results_day and tests >= 1:
             if consec_negative_tests >= n_consec_test:
                 quarantine_end = day
             quarantine_dropout_chance = quarantine_dropout_rate_neg_test
@@ -836,7 +849,7 @@ def calc_quarantine_uninfected(trace_start, quarantine_end, t_exposure,
                 quarantine_end = day
                 if I_monitor:
                     monitor_end = day
-        if test_release and day - test_results_day >= wait_before_testing and trace_start <= day < quarantine_end:
+        if test_release and day - test_results_day >= wait_before_testing and day >= test_day and trace_start <= day < quarantine_end:
             test_results_day = day + test_delay
             tests += 1
             consec_negative_tests += 1
@@ -857,6 +870,7 @@ def calc_quarantine_days_of_uninfected(uninf_g1_source, uninf_g1_exposure_day, u
                                        g0_I_contacted, g0_superspreader, ttq=False,
                                        ttq_double=False, trace=False,
                                        trace_delay=0, test_delay=0, wait_before_testing=0,
+                                       wait_until_testing=0,
                                        early_release=False,
                                        quarantine_by_parent_case_release=np.zeros(1),
                                        early_release_by_parent_case=np.zeros(1),
@@ -879,6 +893,7 @@ def calc_quarantine_days_of_uninfected(uninf_g1_source, uninf_g1_exposure_day, u
             total_contacts += 1
             trace_start = g0_t_self_isolate[parent_case] + trace_delay + test_delay
             quarantine_end = asymp_quarantine_length + uninf_g1_exposure_day[i]
+            test_day = max(uninf_g1_exposure_day[i] + wait_before_testing + wait_until_testing, trace_start + wait_before_testing)
             monitor_start = trace_start
             monitor_end = quarantine_end
             if early_release:
@@ -901,7 +916,8 @@ def calc_quarantine_days_of_uninfected(uninf_g1_source, uninf_g1_exposure_day, u
                                                      I_monitor=monitor,
                                                      n_consec_test=1, test_release=True,
                                                      test_delay=test_delay,
-                                                     wait_before_testing=early_release_by_parent_case[parent_case] + wait_before_testing, #! HACK
+                                                     test_day=test_day,
+                                                     wait_before_testing=wait_before_testing,
                                                      monitor_start=monitor_start,
                                                      monitor_end=monitor_end,
                                                      symptom_false_positive=symptom_false_positive[i],
@@ -925,7 +941,9 @@ def calc_quarantine_days_of_uninfected(uninf_g1_source, uninf_g1_exposure_day, u
                     released_contacts += 1
             elif ttq:
                 tmp = calc_quarantine_uninfected(trace_start=trace_start, quarantine_end=quarantine_end,
-                                                 wait_before_testing=wait_before_testing, test_delay=test_delay,
+                                                 wait_before_testing=wait_before_testing,
+                                                 test_delay=test_delay,
+                                                 test_day=test_day,
                                                  n_consec_test=1, test_release=True, I_monitor=monitor,
                                                  monitor_start=monitor_start,
                                                  monitor_end=monitor_end,
@@ -936,6 +954,7 @@ def calc_quarantine_days_of_uninfected(uninf_g1_source, uninf_g1_exposure_day, u
                 tmp = calc_quarantine_uninfected(trace_start=trace_start, quarantine_end=quarantine_end,
                                                  wait_before_testing=wait_before_testing, test_delay=test_delay,
                                                  n_consec_test=2, test_release=True, I_monitor=monitor,
+                                                 test_day=test_day,
                                                  monitor_start=monitor_start,
                                                  monitor_end=monitor_end,
                                                  symptom_false_positive=symptom_false_positive[i],
@@ -970,7 +989,7 @@ def draw_traced_generation_from_contacts(g0_cases, contacts, trace=False,
                                          trace_delay=0, test_delay=0, trace_false_negative=0.0,
                                          ttq=False, early_release=False,
                                          early_release_day=0, early_release_threshold=0.0,
-                                         wait_before_testing=0,
+                                         wait_before_testing=0, wait_until_testing=0, vacc_eff=0.,
                                          ttq_double=False,
                                          household_SAR=base_household_cal, external_SAR=base_external_cal,
                                          SS_mult=SS_mult_cal, phys_mult=phys_mult_cal,
@@ -995,6 +1014,7 @@ def draw_traced_generation_from_contacts(g0_cases, contacts, trace=False,
          g0_contacts=contacts,
          trace_delay=trace_delay,
          test_delay=test_delay,
+         vacc_eff=vacc_eff,
          trace=trace,
          ttq=ttq,
          ttq_double=ttq_double,
@@ -1083,6 +1103,7 @@ def draw_traced_generation_from_contacts(g0_cases, contacts, trace=False,
             trace_delay=trace_delay,
             test_delay=test_delay,
             wait_before_testing=wait_before_testing,
+            wait_until_testing=wait_until_testing,
             quarantine_by_parent_case_release=quarantine_by_parent_case_release,
             early_release_by_parent_case=early_release_by_parent_case,
             monitor=monitor,
@@ -1106,6 +1127,7 @@ def draw_traced_generation_from_contacts(g0_cases, contacts, trace=False,
             ttq_double=ttq_double,
             trace=trace,
             wait_before_testing=wait_before_testing,
+            wait_until_testing=wait_until_testing,
             trace_delay=trace_delay,
             test_delay=test_delay,
             monitor=monitor,
@@ -1142,6 +1164,7 @@ def draw_traced_generation_from_contacts(g0_cases, contacts, trace=False,
         quarantine_by_parent_case_release=quarantine_by_parent_case_release,
         early_release_by_parent_case=early_release_by_parent_case,
         wait_before_testing=wait_before_testing,
+        wait_until_testing=wait_until_testing,
         monitor=monitor,
         precalc_dropout=precalc_dropout,
         dropouts=dropouts[:len(g1_cases['I_symptoms']), :].reshape(len(g1_cases['I_symptoms']), early_release_day + small_group_extra + 1),
@@ -1157,7 +1180,7 @@ def draw_traced_generation_from_contacts(g0_cases, contacts, trace=False,
     g1_cases['secondary_cases_traced'] = secondary_cases_traced
     g1_cases['secondary_cases_monitored'] = secondary_cases_monitored
     g1_cases['n_isolation_days_of_uninfected'] = isolation_days_of_uninfected
-    return g1_cases
+    return (g1_cases, uninfected_source, uninfected_exposure)
 
 @jit(nopython=True, parallel=True)
 def get_transmission_days(t_exposure, t_last_exposure,
@@ -1204,6 +1227,7 @@ def aggregate_stats_per_index_case(g0_cases, g1_cases, g2_cases, g0_contacts):
     num_contacts_household = np.zeros(len(g0_cases['I_COVID']))
     num_contacts_physical = np.zeros(len(g0_cases['I_COVID']))
     num_deaths = np.zeros(len(g0_cases['I_COVID']))
+
     for (case, _) in enumerate(g0_cases['I_COVID']):
         num_contacts[case] += len(g0_contacts[case])
         for contact in g0_contacts[case]:
@@ -1242,12 +1266,14 @@ def contact_tracing(num_index_cases, trace=False,
                     small_group_threshold=0,
                     small_group_extra=0,
                     wait_before_testing=0,
+                    wait_until_testing=0,
                     ttq_double=False,
                     cluster_pooling_release=False,
                     monitor=False,
                     hold_hh=False,
                     seed=0,
-                    quarantine_dropout_rate=quarantine_dropout_rate_default):
+                    quarantine_dropout_rate=quarantine_dropout_rate_default,
+                    output_json=False):
     np.random.seed(seed)
     g0_cases = draw_seed_index_cases(num_index_cases, age_vector_US, cases_contacted, seed=seed, initial=True)
     n_cases_g0 = np.sum(g0_cases['I_COVID'])
@@ -1263,13 +1289,14 @@ def contact_tracing(num_index_cases, trace=False,
 
     print("quarantine dropout rate ", quarantine_dropout_rate)
     print("quarantine dropout rate observed symptoms ", quarantine_dropout_rate * (1 - dropout_reduction_for_symptoms))
-    g1_cases = draw_traced_generation_from_contacts(g0_cases=g0_cases, contacts=g0_contacts,
+    (g1_cases, g1_uninf_source, g1_uninf_t_exposure) = draw_traced_generation_from_contacts(g0_cases=g0_cases, contacts=g0_contacts,
                                                     trace=trace,
                                                     trace_delay=trace_delay, test_delay=test_delay,
                                                     trace_false_negative=trace_false_negative,
                                                     ttq=ttq, early_release=early_release, early_release_day=early_release_day,
                                                     early_release_threshold=early_release_threshold,
                                                     wait_before_testing=wait_before_testing,
+                                                    wait_until_testing=wait_until_testing,
                                                     ttq_double=ttq_double,
                                                     monitor=monitor,
                                                     seed=seed,
@@ -1285,7 +1312,7 @@ def contact_tracing(num_index_cases, trace=False,
     g1_contacts = draw_contact_generation(g1_cases, base_reduction=base_reduction, seed=seed + 1)
     # print("g1", g1_cases)
     # print("g1_contacts", g1_contacts)
-    g2_cases = draw_traced_generation_from_contacts(g0_cases=g1_cases,
+    (g2_cases, g2_uninf_source, g2_uninf_t_exposure) = draw_traced_generation_from_contacts(g0_cases=g1_cases,
                                                     contacts=g1_contacts,
                                                     trace=False,
                                                     seed=seed + 1)
@@ -1332,6 +1359,77 @@ def contact_tracing(num_index_cases, trace=False,
     print("number of transmission days", np.sum(g1_cases['n_transmission_days']) / num_g1_cases)
     print("number of quarantine days", np.sum(g1_cases['n_quarantine_days']) / num_g1_cases)
 
+    if output_json:
+        json_files = {}
+        for (case, _) in enumerate(g0_cases['I_COVID']):
+            json_tree = {}
+            json_tree['t_exposure'] = float(g0_cases['t_exposure'][case])
+            json_tree['t_last_exposure'] = float(g0_cases['t_last_exposure'][case])
+            json_tree['t_incubation'] = float(g0_cases['t_incubation'][case])
+            json_tree['t_incubation_infect'] = float(g0_cases['t_incubation_infect'][case])
+            json_tree['I_symptoms'] = bool(g0_cases['I_symptoms'][case])
+            json_tree['I_COVID'] = bool(g0_cases['I_COVID'][case])
+            json_tree['I_self_isolate'] = bool(g0_cases['I_self_isolate'][case])
+            json_tree['t_self_isolate_start'] = float(g0_cases['t_self_isolate'][case])
+            json_tree['t_self_isolate_end'] = float(g0_cases['t_self_isolate'][case] + symp_quarantine_length)
+            json_tree['t_trace_start'] = float(g0_cases['t_self_isolate'][case] + test_delay)
+            json_tree['t_trace_finish'] = float(g0_cases['t_self_isolate'][case] + test_delay + trace_delay)
+            json_tree['t_test_day'] = float(g0_cases['t_self_isolate'][case])
+            json_tree['t_test_results_day'] = float(g0_cases['t_self_isolate'][case] + test_delay)
+            json_tree['I_test_positive'] = bool(True)
+            json_tree['I_contacted'] = bool(g0_cases['I_contacted'][case])
+            json_tree['n_age'] = int(g0_cases['n_age'][case])
+            json_tree['contacts'] = {}
+            json_files[case] = json_tree
+        for (case, _) in enumerate(g1_uninf_source):
+            json_tree = {}
+            json_tree['t_exposure'] = float(g1_uninf_exposure)
+            json_tree['I_COVID'] = False
+
+        for (case, _) in enumerate(g1_cases['I_COVID']):
+            json_tree = {}
+            json_tree['t_exposure'] = float(g1_cases['t_exposure'][case])
+            json_tree['t_last_exposure'] = float(g1_cases['t_last_exposure'][case])
+            json_tree['t_incubation'] = float(g1_cases['t_incubation'][case])
+            json_tree['t_incubation_infect'] = float(g1_cases['t_incubation_infect'][case])
+            json_tree['I_symptoms'] = bool(g1_cases['I_symptoms'][case])
+            json_tree['I_COVID'] = bool(g1_cases['I_COVID'][case])
+            json_tree['I_self_isolate'] = bool(g1_cases['I_self_isolate'][case])
+            json_tree['t_self_isolate_start'] = float(g1_cases['t_self_isolate'][case])
+            json_tree['t_self_isolate_end'] = float(g1_cases['t_self_isolate'][case] + symp_quarantine_length)
+            json_tree['I_contacted'] = bool(1 - g1_cases['I_tracing_failed'][case])
+            json_tree['contacts'] = {}
+            for (case2, _) in enumerate(g2_cases['I_COVID']):
+                if g2_cases['id_infected_by'][case2] == case:
+                    json_tree2 = {}
+                    json_tree2['t_exposure'] = float(g2_cases['t_exposure'][case])
+                    json_tree2['t_last_exposure'] = float(g2_cases['t_last_exposure'][case])
+                    json_tree2['t_incubation'] = float(g2_cases['t_incubation'][case])
+                    json_tree2['t_incubation_infect'] = float(g2_cases['t_incubation_infect'][case])
+                    json_tree2['I_symptoms'] = bool(g2_cases['I_symptoms'][case])
+                    json_tree2['I_COVID'] = bool(g2_cases['I_COVID'][case])
+                    json_tree2['I_self_isolate'] = float(g2_cases['I_self_isolate'][case])
+                    json_tree2['t_self_isolate_start'] = float(g2_cases['t_self_isolate'][case])
+                    json_tree2['t_self_isolate_end'] = float(g2_cases['t_self_isolate'][case] + symp_quarantine_length)
+                    json_tree['contacts'][case2] = json_tree2
+            for (case2, _) in g2_uninf_source:
+                if g2_uninf_source[case2] == case:
+                    json_tree2 = {}
+                    json_tree2['t_exposure'] = float(g2_cases['t_exposure'][case])
+                    json_tree2['t_last_exposure'] = float(g2_cases['t_last_exposure'][case])
+                    json_tree2['t_incubation'] = float(g2_cases['t_incubation'][case])
+                    json_tree2['t_incubation_infect'] = float(g2_cases['t_incubation_infect'][case])
+                    json_tree2['I_symptoms'] = bool(g2_cases['I_symptoms'][case])
+                    json_tree2['I_COVID'] = bool(g2_cases['I_COVID'][case])
+                    json_tree2['I_self_isolate'] = float(g2_cases['I_self_isolate'][case])
+                    json_tree2['t_self_isolate_start'] = float(g2_cases['t_self_isolate'][case])
+                    json_tree2['t_self_isolate_end'] = float(g2_cases['t_self_isolate'][case] + symp_quarantine_length)
+                    json_tree['contacts'][case2] = json_tree2
+            json_files[g1_cases['id_infected_by'][case]]['contacts'][case] = json_tree
+        for (case, _) in enumerate(g0_cases['I_COVID']):
+            with open(str(case) + '.json', 'w') as f:
+                json.dump(json_files[case], f)
+    code.interact(local=locals())
     (g0_agg_test, g0_agg_quar, g0_agg_fp, g0_agg_bill, g0_agg_g1, g0_agg_g2,
      g0_n_contacts, g0_n_household, g0_n_physical, g0_n_deaths) = aggregate_stats_per_index_case(g0_cases, g1_cases, g2_cases, g0_contacts)
     g0_agg_hours = 0.5 + g0_n_contacts * 0.25 + (g1_cases['n_monitoring_days_of_uninfected'] + g1_cases['n_quarantine_days_of_uninfected'] + g1_cases['n_isolation_days_of_uninfected'] + g0_agg_bill) * 1/12.
@@ -1516,13 +1614,13 @@ def draw_samples(num_index_cases, trace_delay, test_delay, wait_before_testing,
     code.interact(local=locals())
 
 """ no tracing, no testing """
-def simulate_baseline(num_index_cases, initial=True, base_reduction=0.0,
+def simulate_baseline(num_index_cases, initial=True, base_reduction=0.0, frac_vacc=0., vacc_eff=0.,
                       seed=0):
     np.random.seed(seed)
-    g0_cases = draw_seed_index_cases(num_index_cases, age_vector_US, initial=initial, seed=seed)
+    g0_cases = draw_seed_index_cases(num_index_cases, age_vector_US, initial=initial, frac_vacc=frac_vacc, seed=seed)
     n_cases_g0 = np.sum(g0_cases['I_COVID'])
-    g0_contacts = draw_contact_generation(g0_cases, base_reduction=base_reduction, seed=seed)
-    g1_cases = draw_traced_generation_from_contacts(g0_cases, g0_contacts, seed=seed)
+    g0_contacts = draw_contact_generation(g0_cases, base_reduction=base_reduction, frac_vacc=frac_vacc, seed=seed)
+    g1_cases = draw_traced_generation_from_contacts(g0_cases, g0_contacts, vacc_eff=vacc_eff, seed=seed)
     n_cases_g1 = np.sum(g1_cases['I_COVID'])
     print("n_cases_g1", n_cases_g1)
     aggregated_infections = aggregate_infections(g1_cases['id_original_case'], num_index_cases, np.sum(g1_cases['I_COVID']))
