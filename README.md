@@ -3,8 +3,8 @@
 Author: Andrew Perrault
 
 If you use our code, please cite us:
-Designing Efficient Contact Tracing Through Risk-Based Quarantining
-Andrew Perrault, Marie Charpignon, Jonathan Gruber, Milind Tambe, Maimuna S. Majumder
+Designing Efficient Contact Tracing Through Risk-Based Quarantining.
+Andrew Perrault, Marie Charpignon, Jonathan Gruber, Milind Tambe, Maimuna S. Majumder.
 
 Dependencies:
 Python 3
